@@ -37,6 +37,7 @@ import com.google.common.util.concurrent.MoreExecutors;
 import com.google.protobuf.Descriptors.DescriptorValidationException;
 import io.grpc.Status;
 import io.grpc.Status.Code;
+import io.grpc.StatusRuntimeException;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.Phaser;
@@ -79,7 +80,7 @@ public class WriteToDefaultStream {
         jsonArr.put(record);
       }
 
-      writer.append(new AppendContext(jsonArr, 0));
+      writer.append(new AppendContext(jsonArr, 0, 0));
     }
 
     // Final cleanup for the stream during worker teardown.
@@ -113,16 +114,19 @@ public class WriteToDefaultStream {
 
     JSONArray data;
     int retryCount = 0;
+    int recreateCount = 0;
 
-    AppendContext(JSONArray data, int retryCount) {
+    AppendContext(JSONArray data, int retryCount, int recreateCount) {
       this.data = data;
       this.retryCount = retryCount;
+      this.recreateCount = recreateCount;
     }
   }
 
   private static class DataWriter {
 
     private static final int MAX_RETRY_COUNT = 3;
+    private static final int MAX_RECREATE_COUNT = 3;
     private static final ImmutableList<Code> RETRIABLE_ERROR_CODES =
         ImmutableList.of(
             Code.INTERNAL,
@@ -136,6 +140,7 @@ public class WriteToDefaultStream {
     private final Phaser inflightRequestCount = new Phaser(1);
     private final Object lock = new Object();
     private JsonStreamWriter streamWriter;
+    private TableName savedParentTable;
 
     @GuardedBy("lock")
     private RuntimeException error = null;
@@ -146,8 +151,14 @@ public class WriteToDefaultStream {
       // to the default stream.
       // For more information about JsonStreamWriter, see:
       // https://googleapis.dev/java/google-cloud-bigquerystorage/latest/com/google/cloud/bigquery/storage/v1/JsonStreamWriter.html
+      savedParentTable = parentTable;
       streamWriter =
           JsonStreamWriter.newBuilder(parentTable.toString(), BigQueryWriteClient.create()).build();
+    }
+
+    public void reinitialize() throws DescriptorValidationException, IOException, InterruptedException {
+      streamWriter.close();
+      this.initialize(savedParentTable);
     }
 
     public void append(AppendContext appendContext)
@@ -202,9 +213,9 @@ public class WriteToDefaultStream {
         // If the state is INTERNAL, CANCELLED, or ABORTED, you can retry. For more information,
         // see: https://grpc.github.io/grpc-java/javadoc/io/grpc/StatusRuntimeException.html
         Status status = Status.fromThrowable(throwable);
-        if (appendContext.retryCount < MAX_RETRY_COUNT
-            && RETRIABLE_ERROR_CODES.contains(status.getCode())) {
-          appendContext.retryCount++;
+                
+        // Continue retrying
+        if (throwable instanceof StatusRuntimeException && retryAttempt(status)) {
           try {
             // Since default stream appends are not ordered, we can simply retry the appends.
             // Retrying with exclusive streams requires more careful consideration.
@@ -228,7 +239,9 @@ public class WriteToDefaultStream {
               if (!rowIndexToErrorMessage.containsKey(i)) {
                 dataNew.put(appendContext.data.get(i));
               } else {
-                // process faulty rows by placing them on a dead-letter-queue, for instance
+                  // process faulty rows by placing them on a dead-letter-queue, for instance
+                  // In this example, simply just output to screen
+                  deadLetterQueueErrorRows(ase);
               }
             }
 
@@ -236,7 +249,7 @@ public class WriteToDefaultStream {
             // avoid potentially blocking while we are in a callback.
             if (dataNew.length() > 0) {
               try {
-                this.parent.append(new AppendContext(dataNew, 0));
+                this.parent.append(new AppendContext(dataNew, 0, 0));
               } catch (DescriptorValidationException e) {
                 throw new RuntimeException(e);
               } catch (IOException e) {
@@ -257,6 +270,55 @@ public class WriteToDefaultStream {
           }
         }
         done();
+      }
+    
+      public void deadLetterQueueErrorRows (AppendSerializtionError errors){
+        // Handle the errors, in this example, simply print to console
+        for (Map.Entry<Integer, String> entry : errors.getRowIndexToErrorMessage().entrySet()) {
+            System.out.printf("Bad row index: %d  , has problem: %s\n",entry.getKey(),entry.getValue());
+        } 
+      }
+
+      public boolean retryAttempt(Status status) {
+          // Check if the error code is a valid retryable error 
+          // If not, return false to not retry
+          if (!RETRIABLE_ERROR_CODES.contains(status.getCode())){
+              return false;
+          }
+          // Check to see if we're recreating the stream writer
+          // Update the count of the recreate 
+          // Reset the retry count 
+          // Reintialize the stream writer 
+          if (appendContext.retryCount >= MAX_RETRY_COUNT
+              && appendContext.recreateCount < MAX_RECREATE_COUNT-1 )
+          {
+              appendContext.recreateCount++;
+              appendContext.retryCount = 0;
+              try {
+                  // Wait for 1 second before reinitializing
+                  Thread.sleep(1000);
+                  this.parent.reinitialize();
+              } catch (Exception e) {
+                  // Error in reinitializing 
+                  System.out.format("Failed to reinitialize: %s\n", e);
+                  return false;
+              }
+          }
+          // Should we be retrying?
+          if (appendContext.retryCount < MAX_RETRY_COUNT){
+              appendContext.retryCount++;
+              // Wait for 1 second before reinitializing
+              try {
+                  Thread.sleep(1000);
+              } catch (Exception e) {
+                  // Error in retry sleep
+                  System.out.format("Failed to retry: %s\n", e);
+              }                    
+              return true; 
+          }
+
+          // Don't retry
+          return false;
       }
 
       private void done() {
