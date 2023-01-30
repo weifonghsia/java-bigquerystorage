@@ -60,9 +60,9 @@ public class WriteToDefaultStream {
       throws DescriptorValidationException, InterruptedException, IOException {
     TableName parentTable = TableName.of(projectId, datasetName, tableName);
 
-    DataWriter writer = new DataWriter();
+    DataWriter writer = new DataWriter(parentTable);
     // One time initialization for the worker.
-    writer.initialize(parentTable);
+    writer.initialize();
 
     // Write two batches of fake data to the stream, each with 10 JSON records.  Data may be
     // batched up to the maximum request size:
@@ -140,25 +140,28 @@ public class WriteToDefaultStream {
     private final Phaser inflightRequestCount = new Phaser(1);
     private final Object lock = new Object();
     private JsonStreamWriter streamWriter;
-    private TableName savedParentTable;
+    private TableName parentTable;
 
     @GuardedBy("lock")
     private RuntimeException error = null;
 
-    public void initialize(TableName parentTable)
+    public DataWriter(TableName table){
+      this.parentTable = table; 
+    }
+
+    public void initialize()
         throws DescriptorValidationException, IOException, InterruptedException {
       // Use the JSON stream writer to send records in JSON format. Specify the table name to write
       // to the default stream.
       // For more information about JsonStreamWriter, see:
       // https://googleapis.dev/java/google-cloud-bigquerystorage/latest/com/google/cloud/bigquery/storage/v1/JsonStreamWriter.html
-      savedParentTable = parentTable;
       streamWriter =
           JsonStreamWriter.newBuilder(parentTable.toString(), BigQueryWriteClient.create()).build();
     }
 
     public void reinitialize() throws DescriptorValidationException, IOException, InterruptedException {
       streamWriter.close();
-      this.initialize(savedParentTable);
+      this.initialize();
     }
 
     public void append(AppendContext appendContext)
@@ -241,7 +244,7 @@ public class WriteToDefaultStream {
               } else {
                   // process faulty rows by placing them on a dead-letter-queue, for instance
                   // In this example, simply just output to screen
-                  deadLetterQueueErrorRows(ase);
+                  deadLetterQueueErrorRows(i,appendContext.data.get(i).toString());
               }
             }
 
@@ -272,11 +275,9 @@ public class WriteToDefaultStream {
         done();
       }
     
-      public void deadLetterQueueErrorRows (AppendSerializtionError errors){
+      public void deadLetterQueueErrorRows (int key, String badRowData){
         // Handle the errors, in this example, simply print to console
-        for (Map.Entry<Integer, String> entry : errors.getRowIndexToErrorMessage().entrySet()) {
-            System.out.printf("Bad row index: %d  , has problem: %s\n",entry.getKey(),entry.getValue());
-        } 
+        System.out.printf("Bad row index: %d  , has problem: %s\n",key,badRowData);
       }
 
       public boolean retryAttempt(Status status) {
@@ -285,15 +286,28 @@ public class WriteToDefaultStream {
           if (!RETRIABLE_ERROR_CODES.contains(status.getCode())){
               return false;
           }
+
+          // Should we be retrying?
+          if (appendContext.retryCount < MAX_RETRY_COUNT){
+            appendContext.retryCount++;
+            // Wait for 1 second before reinitializing
+            try {
+                Thread.sleep(1000);
+            } catch (Exception e) {
+                // Error in retry sleep
+                System.out.format("Failed to retry: %s\n", e);
+            }                    
+            return true; 
+          }
+
           // Check to see if we're recreating the stream writer
           // Update the count of the recreate 
           // Reset the retry count 
           // Reintialize the stream writer 
-          if (appendContext.retryCount >= MAX_RETRY_COUNT
-              && appendContext.recreateCount < MAX_RECREATE_COUNT-1 )
-          {
+          if (appendContext.recreateCount < MAX_RECREATE_COUNT){
               appendContext.recreateCount++;
-              appendContext.retryCount = 0;
+              // Set to 1 because it's the first retry of the recreate
+              appendContext.retryCount = 1;
               try {
                   // Wait for 1 second before reinitializing
                   Thread.sleep(1000);
@@ -303,18 +317,7 @@ public class WriteToDefaultStream {
                   System.out.format("Failed to reinitialize: %s\n", e);
                   return false;
               }
-          }
-          // Should we be retrying?
-          if (appendContext.retryCount < MAX_RETRY_COUNT){
-              appendContext.retryCount++;
-              // Wait for 1 second before reinitializing
-              try {
-                  Thread.sleep(1000);
-              } catch (Exception e) {
-                  // Error in retry sleep
-                  System.out.format("Failed to retry: %s\n", e);
-              }                    
-              return true; 
+              return true;
           }
 
           // Don't retry
