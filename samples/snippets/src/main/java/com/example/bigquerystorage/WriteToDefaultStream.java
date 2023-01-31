@@ -125,8 +125,8 @@ public class WriteToDefaultStream {
 
   private static class DataWriter {
 
-    private static final int MAX_RETRY_COUNT = 3;
-    private static final int MAX_RECREATE_COUNT = 3;
+    private static final int MAX_SEND_ATTEMPTS = 3;
+    private static final int MAX_CONNECT_ATTEMPTS = 3;
     private static final ImmutableList<Code> RETRIABLE_ERROR_CODES =
         ImmutableList.of(
             Code.INTERNAL,
@@ -288,7 +288,7 @@ public class WriteToDefaultStream {
           }
 
           // Should we be retrying?
-          if (appendContext.retryCount < MAX_RETRY_COUNT){
+          if (appendContext.retryCount < MAX_SEND_ATTEMPTS){
             appendContext.retryCount++;
             // Wait for 1 second before reinitializing
             try {
@@ -303,8 +303,9 @@ public class WriteToDefaultStream {
           // Check to see if we're recreating the stream writer
           // Update the count of the recreate 
           // Reset the retry count 
-          // Reintialize the stream writer 
-          if (appendContext.recreateCount < MAX_RECREATE_COUNT){
+          // Reintialize the stream writer
+          // Minus 1 since first connection is covered via the initial connection 
+          if (appendContext.recreateCount < MAX_CONNECT_ATTEMPTS - 1){
               appendContext.recreateCount++;
               // Set to 1 because it's the first retry of the recreate
               appendContext.retryCount = 1;
